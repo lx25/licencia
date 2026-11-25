@@ -12,7 +12,8 @@ from typing import Any, Dict, Generator, List, Optional
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
+from fastapi.responses import HTMLResponse
 import psycopg2
 from psycopg2 import errors as pg_errors
 from psycopg2.extensions import connection as PgConnection
@@ -28,9 +29,19 @@ CREATE TABLE IF NOT EXISTS licencias (
     sistema VARCHAR NOT NULL,
     hwid_vinculado VARCHAR NULL,
     estado VARCHAR NOT NULL DEFAULT 'ACTIVA',
+    estado_pago VARCHAR NOT NULL DEFAULT 'PAGADO',
     fecha_vencimiento TIMESTAMP NOT NULL,
+    ultimo_pago TIMESTAMP NULL,
     ultimo_ping TIMESTAMP NULL
 );
+ALTER TABLE licencias ADD COLUMN IF NOT EXISTS estado_pago VARCHAR NOT NULL DEFAULT 'PAGADO';
+ALTER TABLE licencias ADD COLUMN IF NOT EXISTS ultimo_pago TIMESTAMP NULL;
+"""
+
+LICENCIA_COLUMNS = """
+    id, clave_licencia, cliente_nombre, sistema,
+    hwid_vinculado, estado, estado_pago,
+    fecha_vencimiento, ultimo_pago, ultimo_ping
 """
 
 _schema_lock = threading.Lock()
@@ -68,7 +79,7 @@ def _open_connection() -> PgConnection:
 
 
 def ensure_schema(conn: Optional[PgConnection] = None) -> None:
-    """Crea la tabla `licencias` si no existe (idempotente por instancia)."""
+    """Crea o actualiza la tabla `licencias` si no existe (idempotente por instancia)."""
     global _schema_initialized
     if _schema_initialized:
         return
@@ -177,7 +188,9 @@ def _serialize_licencia(row: Dict[str, Any]) -> Dict[str, Any]:
         "sistema": row["sistema"],
         "hwid_vinculado": row["hwid_vinculado"],
         "estado": row["estado"],
+        "estado_pago": row["estado_pago"],
         "fecha_vencimiento": _format_utc_iso(row["fecha_vencimiento"]),
+        "ultimo_pago": _format_utc_iso(row["ultimo_pago"]) if row["ultimo_pago"] else None,
         "ultimo_ping": _format_utc_iso(row["ultimo_ping"]) if row["ultimo_ping"] else None,
     }
 
@@ -185,6 +198,10 @@ def _serialize_licencia(row: Dict[str, Any]) -> Dict[str, Any]:
 class VerificarRequest(BaseModel):
     clave_licencia: str = Field(..., min_length=1)
     hwid: str = Field(..., min_length=1)
+    sistema: Optional[str] = Field(
+        default=None,
+        description="Opcional: valida que la licencia pertenezca a CAFE_POS o PLAYZONE_POS",
+    )
 
 
 class VerificarResponse(BaseModel):
@@ -197,11 +214,29 @@ class CrearLicenciaRequest(BaseModel):
     cliente_nombre: str = Field(..., min_length=1)
     sistema: str = Field(..., min_length=1)
     dias: int = Field(..., gt=0, description="Días de vigencia inicial")
+    pagado: bool = Field(default=True, description="Si el cliente ya realizó el pago inicial")
 
 
 class RenovarLicenciaRequest(BaseModel):
     clave_licencia: str = Field(..., min_length=1)
     dias: int = Field(default=30, gt=0, description="Días a sumar a fecha_vencimiento")
+
+
+class PagoLicenciaRequest(BaseModel):
+    clave_licencia: str = Field(..., min_length=1)
+    dias: int = Field(
+        default=30,
+        ge=0,
+        description="Días a extender desde hoy o el vencimiento actual (0 solo marca pagado)",
+    )
+
+
+class ImpagoLicenciaRequest(BaseModel):
+    clave_licencia: str = Field(..., min_length=1)
+    suspender: bool = Field(
+        default=True,
+        description="Si es True, también cambia estado a SUSPENDIDA inmediatamente",
+    )
 
 
 class SuspenderLicenciaRequest(BaseModel):
@@ -215,7 +250,9 @@ class LicenciaOut(BaseModel):
     sistema: str
     hwid_vinculado: Optional[str]
     estado: str
+    estado_pago: str
     fecha_vencimiento: str
+    ultimo_pago: Optional[str]
     ultimo_ping: Optional[str]
 
 
@@ -232,7 +269,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Servidor Centralizado de Licencias POS",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -249,6 +286,7 @@ def verificar_licencia(
 ) -> VerificarResponse:
     clave = _normalize_required_text(body.clave_licencia, "clave_licencia")
     hwid = _normalize_required_text(body.hwid, "hwid")
+    sistema_solicitado = body.sistema.strip() if body.sistema and body.sistema.strip() else None
 
     private_key = _load_private_key()
     ahora_utc = _utc_now_naive()
@@ -257,7 +295,7 @@ def verificar_licencia(
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT clave_licencia, hwid_vinculado, estado, fecha_vencimiento
+                SELECT clave_licencia, sistema, hwid_vinculado, estado, estado_pago, fecha_vencimiento
                 FROM licencias
                 WHERE clave_licencia = %s
                 FOR UPDATE
@@ -271,6 +309,13 @@ def verificar_licencia(
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail="Licencia no encontrada",
+                )
+
+            if sistema_solicitado is not None and row["sistema"] != sistema_solicitado:
+                conn.rollback()
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Licencia no corresponde a este sistema",
                 )
 
             if row["estado"] == "SUSPENDIDA":
@@ -309,8 +354,10 @@ def verificar_licencia(
 
     payload = {
         "clave": row["clave_licencia"],
+        "sistema": row["sistema"],
         "hwid": hwid,
         "estado": row["estado"],
+        "estado_pago": row["estado_pago"],
         "expira": _format_utc_iso(row["fecha_vencimiento"]),
         "emitido": _format_utc_iso(ahora_utc),
     }
@@ -331,24 +378,28 @@ def crear_licencia(
     clave = _normalize_required_text(body.clave_licencia, "clave_licencia")
     cliente = _normalize_required_text(body.cliente_nombre, "cliente_nombre")
     sistema = _normalize_required_text(body.sistema, "sistema")
-    fecha_vencimiento = _utc_now_naive() + timedelta(days=body.dias)
+    ahora_utc = _utc_now_naive()
+    fecha_vencimiento = ahora_utc + timedelta(days=body.dias)
+    estado_pago = "PAGADO" if body.pagado else "IMPAGO"
+    ultimo_pago = ahora_utc if body.pagado else None
 
     try:
         with conn.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 INSERT INTO licencias (
                     clave_licencia,
                     cliente_nombre,
                     sistema,
                     estado,
-                    fecha_vencimiento
+                    estado_pago,
+                    fecha_vencimiento,
+                    ultimo_pago
                 )
-                VALUES (%s, %s, %s, 'ACTIVA', %s)
-                RETURNING id, clave_licencia, cliente_nombre, sistema,
-                          hwid_vinculado, estado, fecha_vencimiento, ultimo_ping
+                VALUES (%s, %s, %s, 'ACTIVA', %s, %s, %s)
+                RETURNING {LICENCIA_COLUMNS}
                 """,
-                (clave, cliente, sistema, fecha_vencimiento),
+                (clave, cliente, sistema, estado_pago, fecha_vencimiento, ultimo_pago),
             )
             created = cur.fetchone()
         conn.commit()
@@ -378,19 +429,21 @@ def renovar_licencia(
     conn: PgConnection = Depends(get_db),
 ) -> Dict[str, Any]:
     clave = _normalize_required_text(body.clave_licencia, "clave_licencia")
+    ahora_utc = _utc_now_naive()
 
     try:
         with conn.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 UPDATE licencias
                 SET fecha_vencimiento = fecha_vencimiento + make_interval(days => %s),
-                    estado = 'ACTIVA'
+                    estado = 'ACTIVA',
+                    estado_pago = 'PAGADO',
+                    ultimo_pago = %s
                 WHERE clave_licencia = %s
-                RETURNING id, clave_licencia, cliente_nombre, sistema,
-                          hwid_vinculado, estado, fecha_vencimiento, ultimo_ping
+                RETURNING {LICENCIA_COLUMNS}
                 """,
-                (body.dias, clave),
+                (body.dias, ahora_utc, clave),
             )
             updated = cur.fetchone()
         conn.commit()
@@ -399,6 +452,106 @@ def renovar_licencia(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Error al renovar la licencia",
+        ) from exc
+
+    if updated is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Licencia no encontrada",
+        )
+
+    return _serialize_licencia(updated)
+
+
+@app.post(
+    "/api/v1/admin/pago",
+    response_model=LicenciaOut,
+    dependencies=[Depends(require_admin)],
+)
+def registrar_pago(
+    body: PagoLicenciaRequest,
+    conn: PgConnection = Depends(get_db),
+) -> Dict[str, Any]:
+    """Marca la licencia como PAGADO, la activa y opcionalmente suma días desde hoy o su vencimiento."""
+    clave = _normalize_required_text(body.clave_licencia, "clave_licencia")
+    ahora_utc = _utc_now_naive()
+
+    try:
+        with conn.cursor() as cur:
+            if body.dias > 0:
+                cur.execute(
+                    f"""
+                    UPDATE licencias
+                    SET fecha_vencimiento = GREATEST(fecha_vencimiento, %s) + make_interval(days => %s),
+                        estado = 'ACTIVA',
+                        estado_pago = 'PAGADO',
+                        ultimo_pago = %s
+                    WHERE clave_licencia = %s
+                    RETURNING {LICENCIA_COLUMNS}
+                    """,
+                    (ahora_utc, body.dias, ahora_utc, clave),
+                )
+            else:
+                cur.execute(
+                    f"""
+                    UPDATE licencias
+                    SET estado = 'ACTIVA',
+                        estado_pago = 'PAGADO',
+                        ultimo_pago = %s
+                    WHERE clave_licencia = %s
+                    RETURNING {LICENCIA_COLUMNS}
+                    """,
+                    (ahora_utc, clave),
+                )
+            updated = cur.fetchone()
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error al registrar el pago",
+        ) from exc
+
+    if updated is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Licencia no encontrada",
+        )
+
+    return _serialize_licencia(updated)
+
+
+@app.post(
+    "/api/v1/admin/impago",
+    response_model=LicenciaOut,
+    dependencies=[Depends(require_admin)],
+)
+def marcar_impago(
+    body: ImpagoLicenciaRequest,
+    conn: PgConnection = Depends(get_db),
+) -> Dict[str, Any]:
+    """Marca la licencia como IMPAGO y opcionalmente la suspende de inmediato."""
+    clave = _normalize_required_text(body.clave_licencia, "clave_licencia")
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                UPDATE licencias
+                SET estado_pago = 'IMPAGO',
+                    estado = CASE WHEN %s THEN 'SUSPENDIDA' ELSE estado END
+                WHERE clave_licencia = %s
+                RETURNING {LICENCIA_COLUMNS}
+                """,
+                (body.suspender, clave),
+            )
+            updated = cur.fetchone()
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error al marcar impago",
         ) from exc
 
     if updated is None:
@@ -424,12 +577,11 @@ def suspender_licencia(
     try:
         with conn.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 UPDATE licencias
                 SET estado = 'SUSPENDIDA'
                 WHERE clave_licencia = %s
-                RETURNING id, clave_licencia, cliente_nombre, sistema,
-                          hwid_vinculado, estado, fecha_vencimiento, ultimo_ping
+                RETURNING {LICENCIA_COLUMNS}
                 """,
                 (clave,),
             )
@@ -456,17 +608,31 @@ def suspender_licencia(
     response_model=List[LicenciaOut],
     dependencies=[Depends(require_admin)],
 )
-def listar_licencias(conn: PgConnection = Depends(get_db)) -> List[Dict[str, Any]]:
+def listar_licencias(
+    sistema: Optional[str] = Query(default=None, description="Filtrar por sistema (ej. CAFE_POS, PLAYZONE_POS)"),
+    conn: PgConnection = Depends(get_db),
+) -> List[Dict[str, Any]]:
+    filtro = sistema.strip() if sistema and sistema.strip() else None
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT id, clave_licencia, cliente_nombre, sistema,
-                       hwid_vinculado, estado, fecha_vencimiento, ultimo_ping
-                FROM licencias
-                ORDER BY id DESC
-                """
-            )
+            if filtro:
+                cur.execute(
+                    f"""
+                    SELECT {LICENCIA_COLUMNS}
+                    FROM licencias
+                    WHERE sistema = %s
+                    ORDER BY id DESC
+                    """,
+                    (filtro,),
+                )
+            else:
+                cur.execute(
+                    f"""
+                    SELECT {LICENCIA_COLUMNS}
+                    FROM licencias
+                    ORDER BY id DESC
+                    """
+                )
             rows = cur.fetchall()
     except Exception as exc:
         raise HTTPException(
@@ -475,3 +641,150 @@ def listar_licencias(conn: PgConnection = Depends(get_db)) -> List[Dict[str, Any
         ) from exc
 
     return [_serialize_licencia(row) for row in rows]
+
+
+ADMIN_HTML = """<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Panel de Licencias POS</title>
+  <style>
+    :root { font-family: system-ui, -apple-system, sans-serif; color-scheme: dark; }
+    body { margin: 0; background: #0f172a; color: #e2e8f0; padding: 24px; }
+    .wrap { max-width: 1100px; margin: 0 auto; }
+    h1 { margin: 0 0 16px; font-size: 1.5rem; }
+    .card { background: #1e293b; border: 1px solid #334155; border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+    input, select, button { padding: 8px 12px; border-radius: 6px; border: 1px solid #475569; background: #0f172a; color: #f8fafc; font-size: 0.9rem; }
+    button { cursor: pointer; font-weight: 600; border: none; }
+    .btn-primary { background: #2563eb; }
+    .btn-ok { background: #16a34a; }
+    .btn-warn { background: #dc2626; }
+    .btn-muted { background: #334155; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
+    th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid #334155; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 0.75rem; font-weight: 700; }
+    .ok { background: #14532d; color: #86efac; }
+    .bad { background: #7f1d1d; color: #fca5a5; }
+    .sys { background: #1e3a8a; color: #93c5fd; }
+    #msg { margin-top: 8px; font-size: 0.88rem; color: #93c5fd; }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Control de Licencias y Pagos (CaféPOS / PlayZone POS)</h1>
+  <div class="card">
+    <div class="row">
+      <input id="secret" type="password" placeholder="ADMIN_SECRET" style="min-width:240px" />
+      <select id="filtro">
+        <option value="">Todos los sistemas</option>
+        <option value="CAFE_POS">CaféPOS (CAFE_POS)</option>
+        <option value="PLAYZONE_POS">PlayZone POS (PLAYZONE_POS)</option>
+      </select>
+      <button class="btn-primary" onclick="cargar()">Conectar / Actualizar</button>
+    </div>
+    <div id="msg"></div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <input id="n_clave" placeholder="Clave (ej. CAFE-2026-001)" />
+      <input id="n_cliente" placeholder="Nombre del cliente" />
+      <select id="n_sistema">
+        <option value="CAFE_POS">CaféPOS (CAFE_POS)</option>
+        <option value="PLAYZONE_POS">PlayZone POS (PLAYZONE_POS)</option>
+      </select>
+      <input id="n_dias" type="number" value="30" min="1" style="width:90px" />
+      <button class="btn-ok" onclick="crear()">Crear licencia</button>
+    </div>
+  </div>
+
+  <div class="card" style="overflow-x:auto">
+    <table>
+      <thead>
+        <tr>
+          <th>Clave</th><th>Cliente</th><th>Sistema</th><th>Estado</th><th>Pago</th><th>Vence (UTC)</th><th>Último ping</th><th>Acciones</th>
+        </tr>
+      </thead>
+      <tbody id="tbody"></tbody>
+    </table>
+  </div>
+</div>
+<script>
+const el = id => document.getElementById(id);
+el('secret').value = sessionStorage.getItem('adm_sec') || '';
+function msg(t) { el('msg').textContent = t; }
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+async function api(path, method='GET', body=null) {
+  const sec = el('secret').value.trim();
+  sessionStorage.setItem('adm_sec', sec);
+  const res = await fetch(path, {
+    method,
+    headers: { 'Content-Type': 'application/json', 'X-Admin-Secret': sec },
+    body: body ? JSON.stringify(body) : null
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.detail || ('HTTP ' + res.status));
+  return data;
+}
+async function cargar() {
+  try {
+    const f = el('filtro').value;
+    const rows = await api('/api/v1/admin/listar' + (f ? '?sistema=' + encodeURIComponent(f) : ''));
+    el('tbody').innerHTML = rows.map(r => `
+      <tr>
+        <td><code>${esc(r.clave_licencia)}</code></td>
+        <td>${esc(r.cliente_nombre)}</td>
+        <td><span class="badge sys">${esc(r.sistema)}</span></td>
+        <td><span class="badge ${r.estado === 'ACTIVA' ? 'ok' : 'bad'}">${esc(r.estado)}</span></td>
+        <td><span class="badge ${r.estado_pago === 'PAGADO' ? 'ok' : 'bad'}">${esc(r.estado_pago)}</span></td>
+        <td>${esc(r.fecha_vencimiento.slice(0,10))}</td>
+        <td>${r.ultimo_ping ? esc(r.ultimo_ping.slice(0,16).replace('T',' ')) : '-'}</td>
+        <td class="row">
+          <button class="btn-ok" data-act="pago" data-clave="${esc(r.clave_licencia)}">Pagó (+30d)</button>
+          <button class="btn-warn" data-act="impago" data-clave="${esc(r.clave_licencia)}">No pagó</button>
+        </td>
+      </tr>`).join('');
+    msg('Licencias cargadas: ' + rows.length);
+  } catch (e) { msg('Error: ' + e.message); }
+}
+el('tbody').addEventListener('click', ev => {
+  const btn = ev.target.closest('button[data-act]');
+  if (!btn) return;
+  const clave = btn.dataset.clave;
+  if (btn.dataset.act === 'pago') pago(clave, 30);
+  if (btn.dataset.act === 'impago') impago(clave);
+});
+async function crear() {
+  try {
+    await api('/api/v1/admin/crear', 'POST', {
+      clave_licencia: el('n_clave').value,
+      cliente_nombre: el('n_cliente').value,
+      sistema: el('n_sistema').value,
+      dias: Number(el('n_dias').value || 30),
+      pagado: true
+    });
+    el('n_clave').value = ''; el('n_cliente').value = '';
+    await cargar();
+  } catch (e) { msg('Error: ' + e.message); }
+}
+async function pago(clave, dias) {
+  try { await api('/api/v1/admin/pago', 'POST', { clave_licencia: clave, dias }); await cargar(); }
+  catch (e) { msg('Error: ' + e.message); }
+}
+async function impago(clave) {
+  try { await api('/api/v1/admin/impago', 'POST', { clave_licencia: clave, suspender: true }); await cargar(); }
+  catch (e) { msg('Error: ' + e.message); }
+}
+</script>
+</body>
+</html>
+"""
+
+
+@app.get("/admin", response_class=HTMLResponse)
+def admin_panel() -> str:
+    return ADMIN_HTML
