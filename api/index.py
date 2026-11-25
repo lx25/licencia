@@ -69,13 +69,23 @@ def _get_database_url() -> str:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="DATABASE_URL no está configurada en el entorno",
         )
+    if url.lower().startswith("psql "):
+        url = url[5:].strip()
+    if (url.startswith('"') and url.endswith('"')) or (
+        url.startswith("'") and url.endswith("'")
+    ):
+        url = url[1:-1].strip()
     if url.startswith("postgres://"):
         url = "postgresql://" + url[len("postgres://") :]
     return url
 
 
 def _open_connection() -> PgConnection:
-    return psycopg2.connect(_get_database_url(), cursor_factory=RealDictCursor)
+    return psycopg2.connect(
+        _get_database_url(),
+        cursor_factory=RealDictCursor,
+        connect_timeout=8,
+    )
 
 
 def ensure_schema(conn: Optional[PgConnection] = None) -> None:
@@ -101,10 +111,27 @@ def ensure_schema(conn: Optional[PgConnection] = None) -> None:
 
 def get_db() -> Generator[PgConnection, None, None]:
     """Dependencia FastAPI que entrega una conexión PostgreSQL lista y la cierra al finalizar."""
-    conn = _open_connection()
+    try:
+        conn = _open_connection()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        err_line = str(exc).strip().splitlines()[0] if str(exc).strip() else "Fallo de conexión"
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error de conexión a PostgreSQL ({type(exc).__name__}): {err_line}",
+        ) from exc
     try:
         ensure_schema(conn)
         yield conn
+    except HTTPException:
+        raise
+    except Exception as exc:
+        err_line = str(exc).strip().splitlines()[0] if str(exc).strip() else "Fallo de esquema"
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error en base de datos ({type(exc).__name__}): {err_line}",
+        ) from exc
     finally:
         conn.close()
 
