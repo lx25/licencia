@@ -36,6 +36,14 @@ CREATE TABLE IF NOT EXISTS licencias (
 );
 ALTER TABLE licencias ADD COLUMN IF NOT EXISTS estado_pago VARCHAR NOT NULL DEFAULT 'PAGADO';
 ALTER TABLE licencias ADD COLUMN IF NOT EXISTS ultimo_pago TIMESTAMP NULL;
+CREATE TABLE IF NOT EXISTS versiones_app (
+    sistema VARCHAR PRIMARY KEY,
+    version VARCHAR NOT NULL,
+    download_url TEXT NOT NULL,
+    sha256 VARCHAR NOT NULL DEFAULT '',
+    notas TEXT NOT NULL DEFAULT '',
+    actualizado_en TIMESTAMP NOT NULL
+);
 """
 
 LICENCIA_COLUMNS = """
@@ -268,6 +276,14 @@ class ImpagoLicenciaRequest(BaseModel):
 
 class SuspenderLicenciaRequest(BaseModel):
     clave_licencia: str = Field(..., min_length=1)
+
+
+class VersionReleaseRequest(BaseModel):
+    sistema: str = Field(..., min_length=1)
+    version: str = Field(..., min_length=1)
+    download_url: str = Field(..., min_length=1)
+    sha256: str = Field(default="")
+    notas: str = Field(default="")
 
 
 class LicenciaOut(BaseModel):
@@ -670,6 +686,99 @@ def listar_licencias(
     return [_serialize_licencia(row) for row in rows]
 
 
+@app.get("/api/v1/version")
+def obtener_version_publicada(
+    sistema: str = Query(..., min_length=1),
+    conn: PgConnection = Depends(get_db),
+) -> Dict[str, Any]:
+    sys_clean = sistema.strip()
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT sistema, version, download_url, sha256, notas, actualizado_en FROM versiones_app WHERE sistema = %s",
+            (sys_clean,),
+        )
+        row = cur.fetchone()
+    if not row:
+        return {
+            "sistema": sys_clean,
+            "version": "0.0.0",
+            "download_url": "",
+            "sha256": "",
+            "notas": "",
+            "actualizado_en": None,
+        }
+    return {
+        "sistema": row["sistema"],
+        "version": row["version"],
+        "download_url": row["download_url"],
+        "sha256": row["sha256"],
+        "notas": row["notas"],
+        "actualizado_en": _format_utc_iso(row["actualizado_en"]),
+    }
+
+
+@app.get(
+    "/api/v1/admin/versiones",
+    dependencies=[Depends(require_admin)],
+)
+def listar_versiones(conn: PgConnection = Depends(get_db)) -> List[Dict[str, Any]]:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT sistema, version, download_url, sha256, notas, actualizado_en FROM versiones_app ORDER BY sistema"
+        )
+        rows = cur.fetchall()
+    return [
+        {
+            "sistema": r["sistema"],
+            "version": r["version"],
+            "download_url": r["download_url"],
+            "sha256": r["sha256"],
+            "notas": r["notas"],
+            "actualizado_en": _format_utc_iso(r["actualizado_en"]),
+        }
+        for r in rows
+    ]
+
+
+@app.post(
+    "/api/v1/admin/version",
+    dependencies=[Depends(require_admin)],
+)
+def publicar_version(
+    body: VersionReleaseRequest,
+    conn: PgConnection = Depends(get_db),
+) -> Dict[str, Any]:
+    sistema = _normalize_required_text(body.sistema, "sistema")
+    version = _normalize_required_text(body.version, "version")
+    download_url = _normalize_required_text(body.download_url, "download_url")
+    ahora_utc = _utc_now_naive()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO versiones_app (sistema, version, download_url, sha256, notas, actualizado_en)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (sistema) DO UPDATE
+            SET version = EXCLUDED.version,
+                download_url = EXCLUDED.download_url,
+                sha256 = EXCLUDED.sha256,
+                notas = EXCLUDED.notas,
+                actualizado_en = EXCLUDED.actualizado_en
+            RETURNING sistema, version, download_url, sha256, notas, actualizado_en
+            """,
+            (sistema, version, download_url, body.sha256.strip(), body.notas.strip(), ahora_utc),
+        )
+        row = cur.fetchone()
+    conn.commit()
+    return {
+        "sistema": row["sistema"],
+        "version": row["version"],
+        "download_url": row["download_url"],
+        "sha256": row["sha256"],
+        "notas": row["notas"],
+        "actualizado_en": _format_utc_iso(row["actualizado_en"]),
+    }
+
+
 ADMIN_HTML = """<!DOCTYPE html>
 <html lang="es">
 <head>
@@ -700,13 +809,13 @@ ADMIN_HTML = """<!DOCTYPE html>
 </head>
 <body>
 <div class="wrap">
-  <h1>Control de Licencias y Pagos (CaféPOS / PlayZone POS)</h1>
+  <h1>Control de Licencias, Pagos y Actualizaciones OTA (Kafi POS / PlayZone POS)</h1>
   <div class="card">
     <div class="row">
       <input id="secret" type="password" placeholder="ADMIN_SECRET" style="min-width:240px" />
       <select id="filtro">
         <option value="">Todos los sistemas</option>
-        <option value="CAFE_POS">CaféPOS (CAFE_POS)</option>
+        <option value="CAFE_POS">Kafi POS (CAFE_POS)</option>
         <option value="PLAYZONE_POS">PlayZone POS (PLAYZONE_POS)</option>
       </select>
       <button class="btn-primary" onclick="cargar()">Conectar / Actualizar</button>
@@ -719,12 +828,26 @@ ADMIN_HTML = """<!DOCTYPE html>
       <input id="n_clave" placeholder="Clave (ej. CAFE-2026-001)" />
       <input id="n_cliente" placeholder="Nombre del cliente" />
       <select id="n_sistema">
-        <option value="CAFE_POS">CaféPOS (CAFE_POS)</option>
+        <option value="CAFE_POS">Kafi POS (CAFE_POS)</option>
         <option value="PLAYZONE_POS">PlayZone POS (PLAYZONE_POS)</option>
       </select>
       <input id="n_dias" type="number" value="30" min="1" style="width:90px" />
       <button class="btn-ok" onclick="crear()">Crear licencia</button>
     </div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <select id="v_sistema">
+        <option value="CAFE_POS">Kafi POS (CAFE_POS)</option>
+        <option value="PLAYZONE_POS">PlayZone POS (PLAYZONE_POS)</option>
+      </select>
+      <input id="v_version" placeholder="Versión (ej. 1.0.1)" style="width:140px" />
+      <input id="v_url" placeholder="URL del .zip (GitHub Release / ZIP)" style="min-width:280px;flex:1" />
+      <input id="v_sha" placeholder="SHA-256 (opcional)" style="width:180px" />
+      <button class="btn-primary" onclick="publicarVersion()">Publicar Actualización</button>
+    </div>
+    <div id="v_list" style="margin-top:8px;font-size:0.8rem;color:#94a3b8;"></div>
   </div>
 
   <div class="card" style="overflow-x:auto">
@@ -776,6 +899,22 @@ async function cargar() {
         </td>
       </tr>`).join('');
     msg('Licencias cargadas: ' + rows.length);
+    const vers = await api('/api/v1/admin/versiones');
+    el('v_list').innerHTML = vers.length
+      ? 'Versiones activas: ' + vers.map(v => `<strong>${esc(v.sistema)}</strong> v${esc(v.version)}`).join(' | ')
+      : 'Sin actualizaciones OTA publicadas todavía.';
+  } catch (e) { msg('Error: ' + e.message); }
+}
+async function publicarVersion() {
+  try {
+    const res = await api('/api/v1/admin/version', 'POST', {
+      sistema: el('v_sistema').value,
+      version: el('v_version').value,
+      download_url: el('v_url').value,
+      sha256: el('v_sha').value
+    });
+    msg('Actualización publicada: ' + res.sistema + ' v' + res.version);
+    await cargar();
   } catch (e) { msg('Error: ' + e.message); }
 }
 el('tbody').addEventListener('click', ev => {
