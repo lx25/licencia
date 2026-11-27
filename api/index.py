@@ -278,6 +278,18 @@ class SuspenderLicenciaRequest(BaseModel):
     clave_licencia: str = Field(..., min_length=1)
 
 
+class RevocarLicenciaRequest(BaseModel):
+    clave_licencia: str = Field(..., min_length=1)
+    eliminar: bool = Field(
+        default=False,
+        description="Si es True, elimina la licencia permanentemente; si es False, la revoca dejándola SUSPENDIDA",
+    )
+
+
+class ClaveLicenciaRequest(BaseModel):
+    clave_licencia: str = Field(..., min_length=1)
+
+
 class VersionReleaseRequest(BaseModel):
     sistema: str = Field(..., min_length=1)
     version: str = Field(..., min_length=1)
@@ -646,6 +658,152 @@ def suspender_licencia(
     return _serialize_licencia(updated)
 
 
+@app.post(
+    "/api/v1/admin/revocar",
+    dependencies=[Depends(require_admin)],
+)
+def revocar_licencia(
+    body: RevocarLicenciaRequest,
+    conn: PgConnection = Depends(get_db),
+) -> Dict[str, Any]:
+    """Revoca una licencia (la suspende de inmediato o la elimina permanentemente si eliminar=True)."""
+    clave = _normalize_required_text(body.clave_licencia, "clave_licencia")
+
+    try:
+        with conn.cursor() as cur:
+            if body.eliminar:
+                cur.execute(
+                    """
+                    DELETE FROM licencias
+                    WHERE clave_licencia = %s
+                    RETURNING clave_licencia
+                    """,
+                    (clave,),
+                )
+                deleted = cur.fetchone()
+                conn.commit()
+                if deleted is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail="Licencia no encontrada",
+                    )
+                return {
+                    "ok": True,
+                    "clave_licencia": deleted["clave_licencia"],
+                    "accion": "ELIMINADA",
+                }
+
+            cur.execute(
+                f"""
+                UPDATE licencias
+                SET estado = 'SUSPENDIDA'
+                WHERE clave_licencia = %s
+                RETURNING {LICENCIA_COLUMNS}
+                """,
+                (clave,),
+            )
+            updated = cur.fetchone()
+        conn.commit()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error al revocar la licencia",
+        ) from exc
+
+    if updated is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Licencia no encontrada",
+        )
+
+    return _serialize_licencia(updated)
+
+
+@app.post(
+    "/api/v1/admin/reactivar",
+    response_model=LicenciaOut,
+    dependencies=[Depends(require_admin)],
+)
+def reactivar_licencia(
+    body: ClaveLicenciaRequest,
+    conn: PgConnection = Depends(get_db),
+) -> Dict[str, Any]:
+    """Reactiva una licencia suspendida sin modificar su fecha de vencimiento."""
+    clave = _normalize_required_text(body.clave_licencia, "clave_licencia")
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                UPDATE licencias
+                SET estado = 'ACTIVA'
+                WHERE clave_licencia = %s
+                RETURNING {LICENCIA_COLUMNS}
+                """,
+                (clave,),
+            )
+            updated = cur.fetchone()
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error al reactivar la licencia",
+        ) from exc
+
+    if updated is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Licencia no encontrada",
+        )
+
+    return _serialize_licencia(updated)
+
+
+@app.post(
+    "/api/v1/admin/liberar-hwid",
+    response_model=LicenciaOut,
+    dependencies=[Depends(require_admin)],
+)
+def liberar_hwid(
+    body: ClaveLicenciaRequest,
+    conn: PgConnection = Depends(get_db),
+) -> Dict[str, Any]:
+    """Desvincula el HWID actual para permitir activar la licencia en otro equipo."""
+    clave = _normalize_required_text(body.clave_licencia, "clave_licencia")
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                UPDATE licencias
+                SET hwid_vinculado = NULL
+                WHERE clave_licencia = %s
+                RETURNING {LICENCIA_COLUMNS}
+                """,
+                (clave,),
+            )
+            updated = cur.fetchone()
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error al desvincular el HWID",
+        ) from exc
+
+    if updated is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Licencia no encontrada",
+        )
+
+    return _serialize_licencia(updated)
+
+
 @app.get(
     "/api/v1/admin/listar",
     response_model=List[LicenciaOut],
@@ -797,7 +955,9 @@ ADMIN_HTML = """<!DOCTYPE html>
     .btn-primary { background: #2563eb; }
     .btn-ok { background: #16a34a; }
     .btn-warn { background: #dc2626; }
+    .btn-amber { background: #d97706; }
     .btn-muted { background: #334155; }
+    .btn-sm { padding: 5px 9px; font-size: 0.78rem; }
     table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
     th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid #334155; }
     .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 0.75rem; font-weight: 700; }
@@ -854,7 +1014,7 @@ ADMIN_HTML = """<!DOCTYPE html>
     <table>
       <thead>
         <tr>
-          <th>Clave</th><th>Cliente</th><th>Sistema</th><th>Estado</th><th>Pago</th><th>Vence (UTC)</th><th>Último ping</th><th>Acciones</th>
+          <th>Clave</th><th>Cliente</th><th>Sistema</th><th>HWID</th><th>Estado</th><th>Pago</th><th>Vence (UTC)</th><th>Último ping</th><th>Acciones</th>
         </tr>
       </thead>
       <tbody id="tbody"></tbody>
@@ -889,13 +1049,21 @@ async function cargar() {
         <td><code>${esc(r.clave_licencia)}</code></td>
         <td>${esc(r.cliente_nombre)}</td>
         <td><span class="badge sys">${esc(r.sistema)}</span></td>
+        <td title="${esc(r.hwid_vinculado || 'Sin vincular')}"><code>${r.hwid_vinculado ? esc(r.hwid_vinculado.slice(0,10) + '...') : '-'}</code></td>
         <td><span class="badge ${r.estado === 'ACTIVA' ? 'ok' : 'bad'}">${esc(r.estado)}</span></td>
         <td><span class="badge ${r.estado_pago === 'PAGADO' ? 'ok' : 'bad'}">${esc(r.estado_pago)}</span></td>
         <td>${esc(r.fecha_vencimiento.slice(0,10))}</td>
         <td>${r.ultimo_ping ? esc(r.ultimo_ping.slice(0,16).replace('T',' ')) : '-'}</td>
         <td class="row">
-          <button class="btn-ok" data-act="pago" data-clave="${esc(r.clave_licencia)}">Pagó (+30d)</button>
-          <button class="btn-warn" data-act="impago" data-clave="${esc(r.clave_licencia)}">No pagó</button>
+          <button class="btn-ok btn-sm" data-act="pago" data-clave="${esc(r.clave_licencia)}">Pagó (+30d)</button>
+          <button class="btn-amber btn-sm" data-act="impago" data-clave="${esc(r.clave_licencia)}">No pagó</button>
+          ${r.estado === 'ACTIVA'
+            ? `<button class="btn-warn btn-sm" data-act="revocar" data-clave="${esc(r.clave_licencia)}">Revocar</button>`
+            : `<button class="btn-primary btn-sm" data-act="reactivar" data-clave="${esc(r.clave_licencia)}">Reactivar</button>`}
+          ${r.hwid_vinculado
+            ? `<button class="btn-muted btn-sm" data-act="hwid" data-clave="${esc(r.clave_licencia)}">Soltar HWID</button>`
+            : ''}
+          <button class="btn-warn btn-sm" data-act="eliminar" data-clave="${esc(r.clave_licencia)}">Eliminar</button>
         </td>
       </tr>`).join('');
     msg('Licencias cargadas: ' + rows.length);
@@ -921,8 +1089,13 @@ el('tbody').addEventListener('click', ev => {
   const btn = ev.target.closest('button[data-act]');
   if (!btn) return;
   const clave = btn.dataset.clave;
-  if (btn.dataset.act === 'pago') pago(clave, 30);
-  if (btn.dataset.act === 'impago') impago(clave);
+  const act = btn.dataset.act;
+  if (act === 'pago') pago(clave, 30);
+  if (act === 'impago') impago(clave);
+  if (act === 'revocar') revocar(clave, false);
+  if (act === 'reactivar') reactivar(clave);
+  if (act === 'hwid') liberarHwid(clave);
+  if (act === 'eliminar') revocar(clave, true);
 });
 async function crear() {
   try {
@@ -944,6 +1117,32 @@ async function pago(clave, dias) {
 async function impago(clave) {
   try { await api('/api/v1/admin/impago', 'POST', { clave_licencia: clave, suspender: true }); await cargar(); }
   catch (e) { msg('Error: ' + e.message); }
+}
+async function revocar(clave, eliminar) {
+  const texto = eliminar
+    ? `¿Eliminar PERMANENTEMENTE la licencia ${clave}? Esta acción no se puede deshacer.`
+    : `¿Revocar ahora la licencia ${clave}? El POS dejará de funcionar en su próxima verificación.`;
+  if (!confirm(texto)) return;
+  try {
+    await api('/api/v1/admin/revocar', 'POST', { clave_licencia: clave, eliminar });
+    msg(eliminar ? `Licencia ${clave} eliminada.` : `Licencia ${clave} revocada.`);
+    await cargar();
+  } catch (e) { msg('Error: ' + e.message); }
+}
+async function reactivar(clave) {
+  try {
+    await api('/api/v1/admin/reactivar', 'POST', { clave_licencia: clave });
+    msg(`Licencia ${clave} reactivada.`);
+    await cargar();
+  } catch (e) { msg('Error: ' + e.message); }
+}
+async function liberarHwid(clave) {
+  if (!confirm(`¿Desvincular el HWID actual de ${clave} para activarla en otro equipo?`)) return;
+  try {
+    await api('/api/v1/admin/liberar-hwid', 'POST', { clave_licencia: clave });
+    msg(`HWID liberado para ${clave}.`);
+    await cargar();
+  } catch (e) { msg('Error: ' + e.message); }
 }
 </script>
 </body>
